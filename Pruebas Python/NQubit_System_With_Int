@@ -1,0 +1,715 @@
+import cmath
+import itertools
+import math
+import random
+import time
+import tracemalloc
+
+class BlochSphere:
+    """
+    Each instance represents an sphere with theta_steps and phi_steps.
+    The values are steps in a circle of 65536 positions.
+
+    This code emulates the uint16_t registers, the add and substract
+    operations are done with integers and the conversion to radians is done for sin/cos
+    """
+    
+    BITS = 16 # Number of bits used to represent the angle.
+    STEPS = 1 << BITS # 2^16 steps cover all positions.
+    MASK = STEPS - 1 # 0xFFFF converts the add to module 65536
+    DELTA = (2.0 * math.pi) / STEPS # Represented radians in a step
+    ZERO_TOLERANCE_STEPS = 0
+
+    # __slots__ avoids creating an attribute dictionary for each sphere.
+    # The fields are still Python int objects, they are not packed into two bytes as they would be in a uint16 array.
+    __slots__ = ('theta_steps', 'phi_steps')
+
+    def __init__(self, theta_steps: int = 0, phi_steps: int = 0):
+        """Convert the angles to integer and limits them to the interval of steps of a lap"""
+        self.theta_steps = int(theta_steps) & self.MASK
+        self.phi_steps = int(phi_steps) & self.MASK
+        self.apply_physical_constraints()
+
+    @classmethod
+    def rad_to_int(cls, radians: float) -> int:
+        """Transform the angle to the closest step and adjust the lap"""
+        return int(round(radians / cls.DELTA)) & cls.MASK #Dividing by delta gives the index of the step and MASK aplies the module 65536.
+
+    @classmethod
+    def is_effectively_zero(cls, angle_steps: int) -> bool:
+        """
+        Checks if the angle is on the range of tolerance.
+        """
+        angle = int(angle_steps) & cls.MASK  # Normalize the angle
+        distance_to_zero = min(angle, cls.STEPS - angle)  # Measure the shortest distance
+        return distance_to_zero <= cls.ZERO_TOLERANCE_STEPS
+
+    def apply_physical_constraints(self):
+        """
+        Sets the angle to 0 when its on the same step
+        """
+        if self.is_effectively_zero(self.theta_steps):
+            self.theta_steps = 0
+        if self.is_effectively_zero(self.phi_steps):
+            self.phi_steps = 0
+
+    def is_redundant(self, has_controlles: bool) -> bool:
+        """
+        Checks if its an unitary sphere, if theta is 0 in this case, we return true to remove the sphere.
+        In case its not an unitary sphere, we also need to check that phi is 0 to remove the sphere.
+        """
+        theta_is_zero = self.is_effectively_zero(self.theta_steps)
+        if not has_controlles:
+            return theta_is_zero
+        else:
+            return theta_is_zero and self.is_effectively_zero(self.phi_steps)
+
+    def __eq__(self, other):
+        """Compares the angular codes using circular integer distance."""
+        if not isinstance(other, BlochSphere):
+            return False
+        
+        diff_theta = abs(self.theta_steps - other.theta_steps) #Diff between the integer codes
+        diff_theta = min(diff_theta, self.STEPS - diff_theta) # Uses the closest distance
+        
+        diff_phi = abs(self.phi_steps - other.phi_steps)
+        diff_phi = min(diff_phi, self.STEPS - diff_phi)
+        
+        return diff_theta <= self.ZERO_TOLERANCE_STEPS and diff_phi <= self.ZERO_TOLERANCE_STEPS
+
+    def __repr__(self):
+        return f"(theta_steps={self.theta_steps}, phi_steps={self.phi_steps})"
+
+
+class NQubitSystem:
+    def __init__(self, n_qubits: int, spheres: dict, global_phase_steps: int = 0):
+        self.n_qubits = n_qubits
+        self.spheres = spheres 
+        self.global_phase_steps = int(global_phase_steps) & BlochSphere.MASK #Module of global phase
+
+    def to_state_vector(self) -> list[complex]:
+        """
+        It reconstructs the full N-qubit state vector from the Bloch sphere dictionary.
+        Builds the 2^N amplitudes iteratively, processing qubit by qubit and applying
+        the rotations of the sphere parameters. The angles are accumulated like integer,
+        we only use radians for sin/cos.
+        """
+        branch_amplitudes = {0: 1.0 + 0j}  # Initialization of the vector
+        delta = BlochSphere.DELTA 
+        mask = BlochSphere.MASK 
+
+        for i in range(1, self.n_qubits + 1):  
+            new_amplitudes = {}  
+            target_bit_position = self.n_qubits - i  #The first qubit is the most significant one
+
+            # Filter and isolate the entaglement spheres that target the qubit i
+            target_spheres = [  
+                (control_set, sphere)
+                for (target, control_set), sphere in self.spheres.items()
+                if target == i and control_set
+            ]
+
+            unitary_sphere_key = (i, frozenset())
+            base_unitary_sphere = self.spheres.get(unitary_sphere_key, None) #if it was deleted it can be empty
+
+            #Each prefix represents a branch and its accumulated amplitude
+            for prefix, amplitude in branch_amplitudes.items():
+                #Decodefies with previous qubit has value 1, the active ones
+                active_preceding_qubits = {
+                    k for k in range(1, i) 
+                    if (prefix & (1 << (self.n_qubits - k))) != 0
+                }
+                
+                #Initializes theta and phy with base sphere if it exists
+                if base_unitary_sphere is not None:
+                    # The base sphere saves 2*theta_eff, to move a bit we divide by two
+                    effective_theta_steps = base_unitary_sphere.theta_steps >> 1
+                    effective_phi_steps = base_unitary_sphere.phi_steps #Base phi has no 1/2 factor
+                else:
+                    effective_theta_steps = 0  ##Without base sphere, initial rotation is null.
+                    effective_phi_steps = 0
+
+                #adds the contribution of the spheres
+                for control_set, entanglement_sphere in target_spheres:
+                    if control_set.issubset(active_preceding_qubits): #If all the controllers are 1, it is taken into account
+                        effective_theta_steps = (effective_theta_steps + entanglement_sphere.theta_steps) & mask
+                        effective_phi_steps = (effective_phi_steps + entanglement_sphere.phi_steps) & mask
+                
+                # Transforms to radians to apply the calculations
+                effective_theta_rad = effective_theta_steps * delta 
+                effective_phi_rad = effective_phi_steps * delta
+                        
+                #Divides the amplitude between the branches 0 and 1.
+                new_amplitudes[prefix] = amplitude * math.cos(effective_theta_rad)
+                new_amplitudes[prefix | (1 << target_bit_position)] = amplitude * math.sin(effective_theta_rad) * cmath.exp(1j * effective_phi_rad)
+
+            branch_amplitudes = new_amplitudes
+            
+        # global phase multiplies all the amplitudes and its applied at the end
+        global_phase_factor = cmath.exp(1j * (self.global_phase_steps * delta)) 
+        return [branch_amplitudes[idx] * global_phase_factor for idx in range(1 << self.n_qubits)]
+    
+    @classmethod
+    def from_state_vector(cls, state_vector: list[complex]):
+        """
+        Compresses a 2^N state vector into a dictionary of Bloch spheres,
+        following the algorithm described in Theorem 3.
+        """
+        EPSILON = 1e-10  # Range to null
+        num_amplitudes = len(state_vector)
+        if num_amplitudes == 0 or (num_amplitudes & (num_amplitudes - 1)) != 0:
+            raise ValueError("The lenght of vector should be exponent of 2 different than 0.")
+        if any(not math.isfinite(c.real) or not math.isfinite(c.imag) for c in state_vector):
+            raise ValueError("Vector contains infinite amplitudes.")
+        n_qubits = num_amplitudes.bit_length() - 1 #log2
+        mask = BlochSphere.MASK
+
+        norm_factor = math.sqrt(math.fsum([abs(c) ** 2 for c in state_vector]))
+        if norm_factor == 0.0 or not math.isfinite(norm_factor):
+            raise ValueError("Vector cannot be infinite")
+        normalized_vector = [c / norm_factor for c in state_vector]
+
+        #extracts global phase to compare relative phases
+        global_phase_rad = 0.0
+        for comp in normalized_vector:
+            if abs(comp) > EPSILON:
+                global_phase_rad = cmath.phase(comp)
+                break
+
+        global_phase_steps = BlochSphere.rad_to_int(global_phase_rad)  #Saves Gamma 
+        phase_correction = cmath.exp(-1j * global_phase_rad)
+        rotated_vector = [c * phase_correction for c in normalized_vector]
+        extracted_spheres = {}
+        
+        #Mantain the angles in radians to substract the contribution,
+        exact_float_angles = {}
+
+        def canonicalize_float_angle(angle: float) -> float:
+            """Takes the angle to [0, 2pi) and clean the calculations"""
+            angle %= 2.0 * math.pi
+            if abs(angle) < 1e-11 or abs(angle - 2.0 * math.pi) < 1e-11:
+                return 0.0
+            return angle
+
+        #Modules determine theta, relative phases phi
+        magnitudes = [abs(c) for c in rotated_vector] 
+        phases_rad = [cmath.phase(c) for c in rotated_vector]
+
+        for i in range(1, n_qubits + 1):
+            target_bit_position = n_qubits - i  # Binary position of the objective.
+            possible_control_qubits = list(range(1, i))  # Only previous qubits can control it.
+
+            for num_controls in range(0, len(possible_control_qubits) + 1):
+                for control_subset_tuple in itertools.combinations(possible_control_qubits, num_controls):
+                    control_subset = frozenset(control_subset_tuple)
+                    is_unitary_sphere = not control_subset
+
+                    if is_unitary_sphere:
+                        # Base Sphere measure the objective when the previous qubits value is 0
+                        branches_where_target_is_zero = [  # objective=0 and all previous ones=0.
+                            idx for idx in range(num_amplitudes) 
+                            if (idx & (1 << target_bit_position)) == 0 
+                            and all((idx & (1 << (n_qubits - k))) == 0 for k in range(1, i))
+                        ]
+                        branches_where_target_is_one = [  # objetivo=1 and all previous ones=0.
+                            idx for idx in range(num_amplitudes) 
+                            if (idx & (1 << target_bit_position)) != 0 
+                            and all((idx & (1 << (n_qubits - k))) == 0 for k in range(1, i))
+                        ]
+                        
+                        #add the probabilities on those branches
+                        prob_target_zero = math.sqrt(math.fsum([magnitudes[idx] ** 2 for idx in branches_where_target_is_zero]))
+                        prob_target_one = math.sqrt(math.fsum([magnitudes[idx] ** 2 for idx in branches_where_target_is_one]))
+
+                        effective_theta_steps = BlochSphere.rad_to_int(math.atan2(prob_target_one, prob_target_zero))
+                        theta_steps = (effective_theta_steps << 1) & mask  # saves the double so the encoder uses >> 1.
+                        phi_rad = phases_rad[1 << target_bit_position]  # uses as base phase the branch with objective in 1
+
+                        # if theta = 0 we can prune it
+                        new_sphere = BlochSphere(theta_steps, BlochSphere.rad_to_int(phi_rad))
+                        if not new_sphere.is_redundant(has_controlles=False):
+                            extracted_spheres[(i, control_subset)] = new_sphere
+                            # Saves the angles to apply the next calculations
+                            exact_float_angles[(i, control_subset)] = (
+                                canonicalize_float_angle(2.0 * math.atan2(prob_target_one, prob_target_zero)) if new_sphere.theta_steps else 0.0,
+                                canonicalize_float_angle(phi_rad) if new_sphere.phi_steps else 0.0,
+                            )
+
+                    else:
+                        # On controlled spheres we save where the controls are 1 and the other qubits are 0 to calculate the diferential.
+                        branches_where_target_is_zero = [  #controlles J are 1 y the previous rest are 0.
+                            idx for idx in range(num_amplitudes)
+                            if (idx & (1 << target_bit_position)) == 0
+                            and all((idx & (1 << (n_qubits - k))) != 0 for k in control_subset)
+                            and all((idx & (1 << (n_qubits - k))) == 0 for k in possible_control_qubits if k not in control_subset)
+                        ]
+                        branches_where_target_is_one = [
+                            idx for idx in range(num_amplitudes)
+                            if (idx & (1 << target_bit_position)) != 0
+                            and all((idx & (1 << (n_qubits - k))) != 0 for k in control_subset)
+                            and all((idx & (1 << (n_qubits - k))) == 0 for k in possible_control_qubits if k not in control_subset)
+                        ]
+
+                        prob_target_zero = math.sqrt(math.fsum([magnitudes[idx] ** 2 for idx in branches_where_target_is_zero]))
+                        prob_target_one = math.sqrt(math.fsum([magnitudes[idx] ** 2 for idx in branches_where_target_is_one]))
+
+                        unitary_sphere_key = (i, frozenset())
+
+                        # if there is no amplitude in any branch, we set theta = 0 
+                        if prob_target_zero < EPSILON and prob_target_one < EPSILON:
+                            theta_rad = 0.0
+                        else:
+                            effective_theta_rad = math.atan2(prob_target_one, prob_target_zero)
+                            
+                            # uses previous angles to keep precision
+                            unitary_theta_rad = exact_float_angles.get(unitary_sphere_key, (0.0, 0.0))[0] / 2.0
+                        
+                            accumulated_lower_order_theta = 0.0
+                            for k_len in range(1, len(control_subset_tuple)):
+                                for k_subset in itertools.combinations(control_subset_tuple, k_len):
+                                    lower_order_key = (i, frozenset(k_subset))
+                                    accumulated_lower_order_theta += exact_float_angles.get(lower_order_key, (0.0, 0.0))[0]
+                                    
+                            # What is left is the contribution of this group of controls
+                            theta_rad = effective_theta_rad - unitary_theta_rad - accumulated_lower_order_theta
+
+                        #Extracts the conditional phase comparing branches 0 and 1
+                        primary_active_index = (1 << target_bit_position) + sum(1 << (n_qubits - k) for k in control_subset)
+                        
+                        if magnitudes[primary_active_index] > EPSILON:
+                            target_accumulated_phase = exact_float_angles.get(unitary_sphere_key, (0.0, 0.0))[1]
+                            
+                            for k_len in range(1, len(control_subset_tuple)):
+                                for k_subset in itertools.combinations(control_subset_tuple, k_len):
+                                    lower_order_key = (i, frozenset(k_subset))
+                                    target_accumulated_phase += exact_float_angles.get(lower_order_key, (0.0, 0.0))[1]
+                                        
+                            prior_qubits_accumulated_phase = 0.0
+                            for control_qubit in control_subset:
+                                base_control_key = (control_qubit, frozenset())
+                                prior_qubits_accumulated_phase += exact_float_angles.get(base_control_key, (0.0, 0.0))[1]
+                                    
+                                earlier_controls = [c for c in control_subset if c < control_qubit]
+                                for r_c in range(1, len(earlier_controls) + 1):
+                                    for h_subset in itertools.combinations(earlier_controls, r_c):
+                                        historical_control_key = (control_qubit, frozenset(h_subset))
+                                        prior_qubits_accumulated_phase += exact_float_angles.get(historical_control_key, (0.0, 0.0))[1]
+
+                            phi_rad = phases_rad[primary_active_index] - target_accumulated_phase - prior_qubits_accumulated_phase 
+                        else:
+                            phi_rad = 0.0
+
+                        theta_rad = canonicalize_float_angle(theta_rad)
+                        phi_rad = canonicalize_float_angle(phi_rad)
+                        
+                        new_sphere = BlochSphere(
+                            BlochSphere.rad_to_int(theta_rad),
+                            BlochSphere.rad_to_int(phi_rad),
+                        )
+                        
+                        if not new_sphere.is_redundant(has_controlles=True):
+                            extracted_spheres[(i, control_subset)] = new_sphere
+                            exact_float_angles[(i, control_subset)] = (
+                                theta_rad if new_sphere.theta_steps else 0.0,
+                                phi_rad if new_sphere.phi_steps else 0.0,
+                            )
+
+        return cls(n_qubits, extracted_spheres, global_phase_steps)
+
+
+"""
+VALIDATION FUNCTIONS ANG GENERATORS.
+"""
+
+def calculate_state_metrics(original_vector: list[complex], reconstructed_vector: list[complex]) -> dict:
+    """
+    Compare two vectores as pure states and also like amplitude vectors. First it normalize both states
+    and calculates F=|<psi|phi>|^2, ignoring global phase. Afer that it joins the phase and measure the distances
+    between amplitudes.
+    """
+    if len(original_vector) != len(reconstructed_vector):  #Not comparing different dimension
+        raise ValueError("Vectors should have same longitude")
+    if not original_vector:
+        raise ValueError("Vectors cant be empty")
+    if any(not math.isfinite(c.real) or not math.isfinite(c.imag) for c in original_vector + reconstructed_vector):
+        raise ValueError("Vectors contain infinite amplitudes")
+
+    norm_original = math.sqrt(math.fsum(abs(c) ** 2 for c in original_vector))  # ||v||
+    norm_reconstructed = math.sqrt(math.fsum(abs(c) ** 2 for c in reconstructed_vector))  # ||v_rec||
+    if norm_original == 0.0 or norm_reconstructed == 0.0:
+        raise ValueError("Vectors must have norm different than 0")
+
+    original_normalized = [c / norm_original for c in original_vector]
+    reconstructed_normalized = [c / norm_reconstructed for c in reconstructed_vector]
+    #intern complex product determines fidelity and global relative phase
+    overlap = sum(a.conjugate() * b for a, b in zip(original_normalized, reconstructed_normalized))  # <v|v_rec>
+    fidelity = min(1.0, abs(overlap) ** 2)  # F=|<v|v_rec>|^2; set in range
+
+    if abs(overlap) > 0.0:
+        global_phase_delta_rad = cmath.phase(overlap)
+        phase_alignment = cmath.exp(-1j * global_phase_delta_rad)
+    else:
+        global_phase_delta_rad = None
+        phase_alignment = 1.0 + 0j
+
+    # Compare error by coordinate
+    aligned_errors = [a - b * phase_alignment for a, b in zip(original_normalized, reconstructed_normalized)]  # Error after removing global phase
+    aligned_l2_error = math.sqrt(math.fsum(abs(error) ** 2 for error in aligned_errors))  # Euclidean distance
+    max_aligned_amplitude_error = max(abs(error) for error in aligned_errors)
+
+    return {
+        "norm_original": norm_original,
+        "norm_reconstructed": norm_reconstructed,
+        "norm_error": abs(norm_original - norm_reconstructed),
+        "fidelity": fidelity,
+        "infidelity": 1.0 - fidelity,
+        "aligned_l2_error": aligned_l2_error,
+        "max_aligned_amplitude_error": max_aligned_amplitude_error,
+        "global_phase_delta_rad": global_phase_delta_rad,
+    }
+
+
+def calculate_fidelity(original_vector: list[complex], reconstructed_vector: list[complex]) -> float:
+    if len(original_vector) != len(reconstructed_vector):
+        return 0.0
+    return calculate_state_metrics(original_vector, reconstructed_vector)["fidelity"]
+
+
+# Test that controlled phase-only spheres are not pruned and survive a full round trip.
+def test_controlled_phase_only() -> None:
+    base_theta_steps = BlochSphere.rad_to_int(math.pi / 2.0)
+    controlled_phase_steps = BlochSphere.rad_to_int(math.pi)
+
+    spheres = {
+        (1, frozenset()): BlochSphere(base_theta_steps, 0),
+        (2, frozenset()): BlochSphere(base_theta_steps, 0),
+        (2, frozenset({1})): BlochSphere(0, controlled_phase_steps),
+    }
+
+    original_vector = NQubitSystem(2, spheres).to_state_vector()
+    expected_vector = [0.5 + 0j, 0.5 + 0j, 0.5 + 0j, -0.5 + 0j]
+    assert calculate_fidelity(expected_vector, original_vector) >= 1.0 - 1e-12
+
+    decoded_system = NQubitSystem.from_state_vector(original_vector)
+    entanglement_key = (2, frozenset({1}))
+
+    assert entanglement_key in decoded_system.spheres
+    assert decoded_system.spheres[entanglement_key].theta_steps == 0
+    assert decoded_system.spheres[entanglement_key].phi_steps == controlled_phase_steps
+    assert calculate_fidelity(original_vector, decoded_system.to_state_vector()) >= 1.0 - 1e-10
+
+
+def compare_sphere_dicts(dict1: dict, dict2: dict) -> tuple[bool, int, float]:
+    if set(dict1.keys()) != set(dict2.keys()):
+        return False, -1, float('inf')
+
+    max_step_error = 0
+    steps = BlochSphere.STEPS
+
+    for key in dict1:
+        s1, s2 = dict1[key], dict2[key]
+        error_theta = abs(s1.theta_steps - s2.theta_steps)
+        error_theta = min(error_theta, steps - error_theta)
+
+        error_phi = abs(s1.phi_steps - s2.phi_steps)
+        error_phi = min(error_phi, steps - error_phi)
+
+        max_step_error = max(max_step_error, error_theta, error_phi)
+
+    return True, max_step_error, max_step_error * BlochSphere.DELTA
+
+
+def generate_separable_state_vector(n_qubits: int, random_generator=None) -> list[complex]:
+    rng = random_generator or random
+    state_vector = [1.0 + 0j]
+    for _ in range(n_qubits):
+        alpha = complex(rng.uniform(-1, 1), rng.uniform(-1, 1))
+        beta = complex(rng.uniform(-1, 1), rng.uniform(-1, 1))
+        norm = math.sqrt(abs(alpha)**2 + abs(beta)**2)
+        alpha, beta = alpha / norm, beta / norm
+        state_vector = [amp * coef for amp in state_vector for coef in (alpha, beta)]
+    return state_vector
+
+
+def generate_partial_entanglement_vector(n_qubits: int, random_generator=None) -> list[complex]:
+    state_vector = [1.0 + 0j]
+    for i in range(0, n_qubits, 2):
+        if i + 1 < n_qubits:
+            bell_pair_amplitudes = [1/math.sqrt(2), 0, 0, 1/math.sqrt(2)]
+            state_vector = [amp * b for amp in state_vector for b in bell_pair_amplitudes]
+        else:
+            state_vector = [amp * coef for amp in state_vector for coef in (1/math.sqrt(2), 1/math.sqrt(2))]
+    return state_vector
+
+
+def generate_ghz_state_vector(n_qubits: int, random_generator=None) -> list[complex]:
+    dim = 1 << n_qubits
+    state_vector = [0j] * dim
+    state_vector[0] = 1.0 / math.sqrt(2)
+    state_vector[-1] = 1.0 / math.sqrt(2)
+    return state_vector
+
+
+def generate_ghz_blocks_vector(n_qubits: int, block_size: int = 3, random_generator=None) -> list[complex]:
+    if n_qubits < 1 or block_size < 1:
+        raise ValueError("n_qubits y block_size deben ser mayores que cero.")
+    state_vector = [1.0 + 0j]
+    for start in range(0, n_qubits, block_size):
+        current_block_size = min(block_size, n_qubits - start)
+        block_dim = 1 << current_block_size
+        block_vector = [0j] * block_dim
+        if current_block_size == 1:
+            block_vector[0] = 1.0 / math.sqrt(2)
+            block_vector[-1] = 1.0 / math.sqrt(2)
+        else:
+            block_vector[0] = 1.0 / math.sqrt(2)
+            block_vector[-1] = 1.0 / math.sqrt(2)
+        state_vector = [amp * value for amp in state_vector for value in block_vector]
+    return state_vector
+
+
+def generate_w_state_vector(n_qubits: int, random_generator=None) -> list[complex]:
+    dim = 1 << n_qubits
+    state_vector = [0j] * dim
+    amplitude = 1.0 / math.sqrt(n_qubits)
+    for i in range(n_qubits):
+        state_vector[1 << i] = amplitude + 0j
+    return state_vector
+
+
+def generate_dense_random_vector(n_qubits: int, random_generator=None) -> list[complex]:
+    rng = random_generator or random
+    dim = 1 << n_qubits
+    state_vector = [complex(rng.uniform(-1, 1), rng.uniform(-1, 1)) for _ in range(dim)]
+    norm = math.sqrt(sum(abs(c)**2 for c in state_vector))
+    return [c / norm for c in state_vector]
+
+
+def generate_random_spheres(n_qubits: int, density: float = 1.0, random_generator=None) -> dict:
+    rng = random_generator or random
+    spheres = {}
+    steps = BlochSphere.STEPS
+    min_safe_steps = 15
+
+    for i in range(1, n_qubits + 1):
+        theta_unitary_steps = rng.randint(7000, 9000) << 1
+        phi_unitary_steps = rng.randint(1000, steps - 1000)
+        spheres[(i, frozenset())] = BlochSphere(theta_unitary_steps, phi_unitary_steps)
+
+        if density > 0.0:
+            possible_controls = list(range(1, i))
+            all_combinations = [
+                frozenset(subset_tuple)
+                for length in range(1, len(possible_controls) + 1)
+                for subset_tuple in itertools.combinations(possible_controls, length)
+                if rng.random() <= density
+            ]
+
+            if all_combinations:
+                max_positive_spheres = (len(all_combinations) // 2) + 1
+                max_steps_per_sphere = max(min_safe_steps + 5, 5000 // max_positive_spheres)
+
+                for idx, subset in enumerate(all_combinations):
+                    magnitude_steps = rng.randint(min_safe_steps, max_steps_per_sphere)
+                    sign = 1 if (idx % 2 == 0) else -1
+
+                    theta_controlled_steps = (sign * magnitude_steps) & BlochSphere.MASK
+                    phi_controlled_steps = rng.randint(1000, steps - 1000)
+
+                    new_sphere = BlochSphere(theta_controlled_steps, phi_controlled_steps)
+                    if not new_sphere.is_redundant(has_controlles=True):
+                        spheres[(i, subset)] = new_sphere
+
+    return spheres
+
+
+def generate_sqrt_half_pattern_system(n_qubits: int, seed: int = 20261028):
+    if n_qubits < 4:
+        raise ValueError("El patrón requiere al menos 4 qubits.")
+
+    rng = random.Random(seed)
+    angles = [rng.uniform(0.30, 1.20)]
+    while len(angles) < n_qubits - 1:
+        angles.append(math.sqrt(angles[-1]) / 2.0)
+
+    base_half_angle_steps = BlochSphere.rad_to_int(0.25)
+    base_theta_steps = base_half_angle_steps << 1
+
+    spheres = {
+        (target, frozenset()): BlochSphere(base_theta_steps, 0)
+        for target in range(1, n_qubits + 1)
+    }
+
+    for target, angle in zip(range(2, n_qubits + 1), angles):
+        spheres[(target, frozenset({target - 1}))] = BlochSphere(
+            BlochSphere.rad_to_int(angle), 0
+        )
+
+    one_step_key = (n_qubits, frozenset({1, 2}))
+    zero_step_key = (n_qubits, frozenset({1, 2, 3}))
+    spheres[one_step_key] = BlochSphere(1, 0)
+    spheres[zero_step_key] = BlochSphere(0, 0)
+
+    return NQubitSystem(n_qubits, spheres), angles, one_step_key, zero_step_key
+
+
+# Test deterministic quantization, zero-sphere pruning, and preservation of a one-step sphere.
+def test_random_sqrt_half_pattern(seed: int = 20261028, n_qubits: int = 8) -> dict:
+    system, angles, one_step_key, zero_step_key = generate_sqrt_half_pattern_system(n_qubits, seed)
+
+    original_vector = system.to_state_vector()
+    decoded_system = NQubitSystem.from_state_vector(original_vector)
+    reconstructed_vector = decoded_system.to_state_vector()
+
+    expected_keys = set(system.spheres) - {zero_step_key}
+    assert set(decoded_system.spheres) == expected_keys, (
+        "La decodificación debe omitir el control nulo y conservar el control de un paso."
+    )
+    assert decoded_system.spheres[one_step_key].theta_steps == 1
+
+    state_metrics = calculate_state_metrics(original_vector, reconstructed_vector)
+    fidelity = state_metrics["fidelity"]
+    assert fidelity >= 0.99999, f"Fidelidad insuficiente para el patrón: {fidelity}"
+
+    return {
+        "seed": seed,
+        "n_qubits": n_qubits,
+        "angles_rad": angles,
+        "fidelity": fidelity,
+        "state_metrics": state_metrics,
+        "sphere_count": len(decoded_system.spheres),
+    }
+
+
+# Run both round-trip test suites and report their metrics.
+def run_performance_tests(n_qubits=8, seed=20261028):
+    print(f"\n" + "="*70)
+    print(f" DIRECTION 1: VECTOR -> SPHERES -> VECTOR ({n_qubits} QUBITS)")
+    print(f"="*70)
+
+    # Test vector -> spheres -> vector for each configured state family.
+    scenarios_vector_to_spheres = [
+        ("Case 1: Separable State", generate_separable_state_vector),
+        ("Case 2: Bell Pairs", generate_partial_entanglement_vector),
+        ("Case 3: Global GHZ", generate_ghz_state_vector),
+        ("Case 4: Independent GHZ Blocks of 3", generate_ghz_blocks_vector),
+        ("Case 5: W-State", generate_w_state_vector),
+        ("Case 6: Dense Random Vector", generate_dense_random_vector)
+    ]
+
+    for scenario_index, (scenario_name, generator_function) in enumerate(scenarios_vector_to_spheres):
+        print(f"\n{scenario_name}")
+        rng = random.Random(seed + n_qubits * 100 + scenario_index)
+        original_vector = generator_function(n_qubits, random_generator=rng)
+
+        t0 = time.perf_counter()
+        quantum_system = NQubitSystem.from_state_vector(original_vector)
+        time_decode_1 = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        reconstructed_vector = quantum_system.to_state_vector()
+        time_encode = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        quantum_system_2 = NQubitSystem.from_state_vector(reconstructed_vector)
+        time_decode_2 = time.perf_counter() - t0
+        same_sphere_keys, max_sphere_step_error, max_sphere_angle_error = compare_sphere_dicts(quantum_system.spheres, quantum_system_2.spheres)
+
+        tracemalloc.start()
+        _ = NQubitSystem.from_state_vector(original_vector)
+        _, peak_memory = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        state_metrics = calculate_state_metrics(original_vector, reconstructed_vector)
+        fidelity = state_metrics["fidelity"]
+        assert fidelity >= 0.999, (
+            f"Fidelity dropped below initial threshold in {scenario_name}, N={n_qubits}: {fidelity}"
+        )
+        spheres_used = len(quantum_system.spheres)
+        theoretical_spheres = (1 << n_qubits) - 1
+        retained_sphere_percent = 100.0 * spheres_used / theoretical_spheres
+        pruned_sphere_percent = 100.0 - retained_sphere_percent
+        peak_ram_mb = peak_memory / (1024 * 1024)
+
+        print(f"  Spheres extracted: {spheres_used} (2nd pass: {len(quantum_system_2.spheres)})")
+        print(f"  Sphere representation stable: {same_sphere_keys}; max step error={max_sphere_step_error}, max angle={max_sphere_angle_error:.3e} rad")
+        print(f"  Fidelity (F): {fidelity:.12f} | infidelity (1-F): {state_metrics['infidelity']:.3e}")
+        print(f"  Norms: input={state_metrics['norm_original']:.12f}, reconstructed={state_metrics['norm_reconstructed']:.12f}, error={state_metrics['norm_error']:.3e}")
+        print(f"  Phase-aligned errors: L2={state_metrics['aligned_l2_error']:.3e}, max amplitude={state_metrics['max_aligned_amplitude_error']:.3e}")
+        print(f"  Global phase difference (rad): {state_metrics['global_phase_delta_rad']}")
+        print(f"  Theoretical spheres: {spheres_used}/{theoretical_spheres} retained ({retained_sphere_percent:.4f}%), {pruned_sphere_percent:.4f}% pruned")
+        print(f"  [Time 1] Decoding (Vector -> Spheres):       {time_decode_1:.6f} s")
+        print(f"  [Time 2] Encoding (Spheres -> Vector):       {time_encode:.6f} s")
+        print(f"  [Time 3] Re-Decoding (Vector_rec -> Spheres): {time_decode_2:.6f} s")
+        print(f"  [Total Time]: {(time_decode_1 + time_encode + time_decode_2):.6f} s")
+        print(f"  Decoder extra peak (input vector excluded): {peak_ram_mb:.4f} MB")
+
+    print(f"\n" + "="*70)
+    print(f" DIRECTION 2: RANDOM SPHERES -> VECTOR -> SPHERES ({n_qubits} QUBITS)")
+    print(f"="*70)
+
+    # Test spheres -> vector -> spheres across the configured controlled-sphere densities.
+    scenarios_spheres_to_vector = [
+        ("Random Spheres 1: No controlled spheres", 0.0),
+        ("Random Spheres 2: ~25% controlled-sphere density", 0.25),
+        ("Random Spheres 3: ~50% controlled-sphere density", 0.50),
+        ("Random Spheres 4: ~75% controlled-sphere density", 0.75),
+        ("Random Spheres 5: All controlled-sphere keys", 1.0)
+    ]
+
+    for scenario_index, (name, density) in enumerate(scenarios_spheres_to_vector):
+        print(f"\n{name}")
+        rng = random.Random(seed + n_qubits * 100 + 100 + scenario_index)
+        original_spheres = generate_random_spheres(n_qubits, density=density, random_generator=rng)
+        system_orig = NQubitSystem(n_qubits, original_spheres, global_phase_steps=0)
+
+        t0 = time.perf_counter()
+        intermediate_vector = system_orig.to_state_vector()
+        time_encode_1 = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        system_reconstructed = NQubitSystem.from_state_vector(intermediate_vector)
+        time_decode = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        vector_check = system_reconstructed.to_state_vector()
+        time_encode_2 = time.perf_counter() - t0
+
+        reconstructed_spheres = system_reconstructed.spheres
+        same_keys, max_step_err, max_angle_error = compare_sphere_dicts(original_spheres, reconstructed_spheres)
+        state_metrics = calculate_state_metrics(intermediate_vector, vector_check)
+        fidelity_s2s = state_metrics["fidelity"]
+
+        assert same_keys, f"Sphere topology changed in {name}, N={n_qubits}"
+        assert max_step_err <= 1, (
+            f"Angle error exceeded one step in {name}, N={n_qubits}: {max_step_err}"
+        )
+        assert fidelity_s2s >= 0.9999, (
+            f"Insufficient fidelity in {name}, N={n_qubits}: {fidelity_s2s}"
+        )
+
+        print(f"  Original Spheres created: {len(original_spheres)} | Recovered: {len(reconstructed_spheres)}")
+        print(f"  Exact Topology Match (Same Spheres): {'YES' if same_keys else 'NO'}")
+        print(f"  Max Integer Step Error: {max_step_err} steps (out of 65536)")
+        print(f"  Max Angular Error (rad): {max_angle_error:.6f} rad")
+        print(f"  Reconstruction Fidelity: {fidelity_s2s:.12f} | infidelity: {state_metrics['infidelity']:.3e}")
+        print(f"  Norm error: {state_metrics['norm_error']:.3e} | aligned L2: {state_metrics['aligned_l2_error']:.3e} | max amplitude: {state_metrics['max_aligned_amplitude_error']:.3e}")
+        print(f"  [Time 1] Encoding (Spheres -> Vector):        {time_encode_1:.6f} s")
+        print(f"  [Time 2] Decoding (Vector -> Spheres):        {time_decode:.6f} s")
+        print(f"  [Time 3] Re-Encoding (Spheres_rec -> Vector): {time_encode_2:.6f} s")
+        print(f"  [Total Time]: {(time_encode_1 + time_decode + time_encode_2):.6f} s")
+
+
+if __name__ == "__main__":
+    test_controlled_phase_only()
+    patterned = test_random_sqrt_half_pattern()
+    print(
+        f"Pattern sqrt/2 passed: seed={patterned['seed']}, "
+        f"F={patterned['fidelity']:.10f}, spheres={patterned['sphere_count']}"
+    )
+    run_performance_tests(n_qubits=4)
+    run_performance_tests(n_qubits=8)
+    run_performance_tests(n_qubits=10)
+    run_performance_tests(n_qubits=12)
+    run_performance_tests(n_qubits=14)
+    run_performance_tests(n_qubits=16)
