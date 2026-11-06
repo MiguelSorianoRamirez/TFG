@@ -694,10 +694,10 @@ def run_performance_tests(n_qubits=8, seed=20261028):
         print(f"  Max Angular Error (rad): {max_angle_error:.6f} rad")
         print(f"  Reconstruction Fidelity: {fidelity_s2s:.12f} | infidelity: {state_metrics['infidelity']:.3e}")
         print(f"  Norm error: {state_metrics['norm_error']:.3e} | aligned L2: {state_metrics['aligned_l2_error']:.3e} | max amplitude: {state_metrics['max_aligned_amplitude_error']:.3e}")
-        print(f"  [Time 1] Encoding (Spheres -> Vector):        {time_encode_1:.6f} s")
-        print(f"  [Time 2] Decoding (Vector -> Spheres):        {time_decode:.6f} s")
-        print(f"  [Time 3] Re-Encoding (Spheres_rec -> Vector): {time_encode_2:.6f} s")
-        print(f"  [Total Time]: {(time_encode_1 + time_decode + time_encode_2):.6f} s")
+        print(f"  Time 1 Encoding (Spheres -> Vector):        {time_encode_1:.6f} s")
+        print(f"  Time 2 Decoding (Vector -> Spheres):        {time_decode:.6f} s")
+        print(f"  Time 3 Re-Encoding (Spheres_rec -> Vector): {time_encode_2:.6f} s")
+        print(f"  Total Time: {(time_encode_1 + time_decode + time_encode_2):.6f} s")
 
 
 if __name__ == "__main__":
